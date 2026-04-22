@@ -747,15 +747,69 @@
             /**
              * FORENSIC LOGIC
              */
+            // Use relative URL when served from same origin, fallback to localhost for dev
+            const BACKEND_URL = window.location.origin;
             const bc = new BroadcastChannel('scanner_channel');
             const initiateBtn = document.getElementById('initiateChallenge');
             const logs = document.getElementById('logs');
             const resultOverlay = document.getElementById('resultOverlay');
-            const vitalityTag = document.getElementById('vitalityTag');
             const hrText = document.getElementById('heartRate');
             const ambientDimmer = document.getElementById('ambient-dimmer');
             const mainConsole = document.getElementById('main-console');
             const verdictModal = document.getElementById('verdictModal');
+
+            // Check backend health on load
+            (async () => {
+                try {
+                    const res = await fetch(`${BACKEND_URL}/health`);
+                    const data = await res.json();
+                    addLog(`SYSTEM: BACKEND_CONNECTED (${data.version})`, 'var(--primary-neon)');
+                } catch (e) {
+                    addLog('WARNING: BACKEND_OFFLINE - Start server on port 8000', 'var(--accent-neon)');
+                }
+            })();
+
+            let mediaRecorder;
+            let recordedChunks = [];
+
+            async function startRecording() {
+                const stream = document.getElementById('localVideo').srcObject;
+                if (!stream) {
+                    addLog('ERROR: CAMERA_NOT_FOUND', 'var(--accent-neon)');
+                    return null;
+                }
+
+                recordedChunks = [];
+                // Use a supported mimeType
+                const options = { mimeType: 'video/webm;codecs=vp8' };
+                if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+                    options.mimeType = 'video/webm';
+                }
+
+                mediaRecorder = new MediaRecorder(stream, options);
+                
+                mediaRecorder.ondataavailable = (e) => {
+                    if (e.data.size > 0) recordedChunks.push(e.data);
+                };
+
+                return new Promise((resolve) => {
+                    mediaRecorder.onstop = () => {
+                        const blob = new Blob(recordedChunks, { type: 'video/webm' });
+                        resolve(blob);
+                    };
+                    
+                    mediaRecorder.start();
+                    addLog('SENSOR: CAPTURING_BIOMETRIC_DATA...', 'var(--primary-neon)');
+                    
+                    // Record for 3 seconds
+                    setTimeout(() => {
+                        if (mediaRecorder.state === 'recording') {
+                            mediaRecorder.stop();
+                            addLog('SENSOR: CAPTURE_COMPLETE', 'var(--primary-neon)');
+                        }
+                    }, 3000);
+                });
+            }
 
             function addLog(msg, color = 'white/40') {
                 const div = document.createElement('div');
@@ -764,7 +818,7 @@
                 logs.prepend(div);
             }
 
-            initiateBtn.addEventListener('click', () => {
+            initiateBtn.addEventListener('click', async () => {
                 addLog('SYSTEM: INITIATING_CHALLENGE_PROTOCOL...', 'var(--primary-neon)');
                 bc.postMessage({ type: 'START_FLASH' });
 
@@ -772,31 +826,67 @@
                 initiateBtn.style.opacity = '0.5';
 
                 addLog('SENSOR: FLASH_SEQUENCE_BROADCASTED', 'var(--primary-neon)');
-
                 resultOverlay.classList.add('hidden');
                 setTelemetry(0, 0, '--');
-            });
 
-            bc.onmessage = (e) => {
-                if (e.data.type === 'FLASH_READY') {
-                    addLog('STATUS: SUBJECT_CONNECTED_PORT_889', 'var(--primary-neon)');
-                    document.getElementById('pingValue').textContent = 'PING: 18ms';
-                }
-                if (e.data.type === 'FLASH_COMPLETE') {
-                    addLog('DATA_RECEIVED: ANALYZING SPECTRAL RESPONSE...', 'var(--primary-neon)');
+                try {
+                    const videoBlob = await startRecording();
+                    if (!videoBlob) throw new Error('Capture failed');
 
-                    setTimeout(() => {
-                        setTelemetry(99.4, 98.8, '72');
+                    addLog('NETWORK: UPLOADING_TO_FORENSIC_NODE...', 'var(--primary-neon)');
+                    
+                    const formData = new FormData();
+                    formData.append('file', videoBlob, 'analysis.webm');
+
+                    const response = await fetch(`${BACKEND_URL}/analyze`, {
+                        method: 'POST',
+                        body: formData
+                    });
+
+                    if (!response.ok) {
+                        const errText = await response.text().catch(() => '');
+                        throw new Error(`Server returned ${response.status}: ${errText.slice(0, 100)}`);
+                    }
+
+                    const data = await response.json();
+                    addLog('DATA_RECEIVED: ANALYSIS_COMPLETE', 'var(--primary-neon)');
+
+                    // Map backend response to UI
+                    // Backend returns: { verdict, confidence_score, details: { rppg: {score, bpm_estimate}, spectral: {score}, ... } }
+                    const confidenceScore = data.confidence_score || 0;
+                    const liveness = Math.round(confidenceScore * 100);
+                    const spectral = Math.round((data.details?.spectral?.score || 0) * 100);
+                    const bpm = data.details?.rppg?.bpm_estimate || 72;
+
+                    setTelemetry(spectral, liveness, bpm);
+
+                    // Log individual module results
+                    if (data.details) {
+                        for (const [mod, res] of Object.entries(data.details)) {
+                            if (res && res.label) {
+                                addLog(`MODULE[${mod.toUpperCase()}]: ${res.label} (${(res.score * 100).toFixed(0)}%)`, 'var(--primary-neon)');
+                            }
+                        }
+                    }
+                    
+                    if (data.verdict === 'REAL' || confidenceScore > 0.5) {
                         resultOverlay.classList.remove('hidden');
-                        initiateBtn.disabled = false;
-                        initiateBtn.style.opacity = '1';
-                        addLog('VERDICT: BIOMETRIC_MATCH_VERIFIED (P=0.9942)', 'var(--primary-neon)');
-
-                        // Show Verdict Report
+                        addLog(`VERDICT: BIOMETRIC_MATCH_VERIFIED (P=${confidenceScore.toFixed(4)})`, 'var(--primary-neon)');
                         verdictModal.classList.remove('opacity-0', 'pointer-events-none');
-                    }, 2000);
+                    } else {
+                        addLog(`VERDICT: ${data.verdict || 'DEEPFAKE_DETECTED'}_NODE_LOCKED (P=${confidenceScore.toFixed(4)})`, 'var(--accent-neon)');
+                        mainConsole.classList.add('glitch-active');
+                        setTimeout(() => mainConsole.classList.remove('glitch-active'), 1000);
+                    }
+
+                } catch (error) {
+                    addLog(`ERROR: ${error.message}`, 'var(--accent-neon)');
+                    console.error('Analysis failed:', error);
+                } finally {
+                    initiateBtn.disabled = false;
+                    initiateBtn.style.opacity = '1';
                 }
-            };
+            });
 
             function setTelemetry(s, l, hr) {
                 document.getElementById('spectralValue').textContent = s + '%';
